@@ -8,18 +8,33 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify, session
-from flask_cors import CORS
-from functools import wraps
-import json
-from datetime import datetime
-from instagram_api import InstagramClient
-from follower_analyzer import FollowerAnalyzer
-from config import Config
+try:
+    from flask import Flask, render_template, request, jsonify, session
+    from flask_cors import CORS
+    from functools import wraps
+    import json
+    from datetime import datetime
+    from instagram_api import InstagramClient
+    from follower_analyzer import FollowerAnalyzer
+    from config import Config
+except Exception as e:
+    # Fallback for missing dependencies
+    from flask import Flask, jsonify
+    InstagramClient = None
+    FollowerAnalyzer = None
+    Config = None
 
-app = Flask(__name__, template_folder='../templates', static_folder='../static')
-app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
-CORS(app)
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'vercel-secret-key')
+
+try:
+    CORS(app)
+except:
+    pass
+
+# Configure upload folder
+if Config:
+    Config.ensure_cache_dir()
 
 # Configure upload folder
 Config.ensure_cache_dir()
@@ -38,14 +53,35 @@ def login_required(f):
 @app.route('/')
 def index():
     """Home page"""
-    return render_template('index.html')
+    try:
+        return render_template('index.html')
+    except:
+        # Fallback if templates not available
+        return jsonify({
+            'app': 'Instagram Follower Analyzer',
+            'version': '1.0.0',
+            'status': 'API is running',
+            'endpoints': {
+                '/api/health': 'Health check',
+                '/api/login': 'POST - Login',
+                '/api/logout': 'POST - Logout',
+                '/api/fetch': 'POST - Fetch data',
+                '/api/analysis': 'GET - Get analysis',
+                '/api/unfollowers': 'GET - Get unfollowers',
+                '/api/not-following-back': 'GET - Get not following back',
+                '/api/mutual': 'GET - Get mutual followers'
+            }
+        })
 
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
     """Login endpoint"""
+    if not InstagramClient:
+        return jsonify({'error': 'Dependencies not available'}), 503
+    
     try:
-        data = request.json
+        data = request.json or {}
         username = data.get('username')
         password = data.get('password')
         
@@ -67,7 +103,7 @@ def api_login():
             return jsonify({'error': 'Login failed'}), 401
             
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'Login error: {str(e)}'}), 500
 
 
 @app.route('/api/logout', methods=['POST'])
