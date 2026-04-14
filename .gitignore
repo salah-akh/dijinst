@@ -31,8 +31,6 @@ wheels/
 # Cache
 cache/
 .cache/
-*.json
-session.json
 
 # IDE
 .vscode/
