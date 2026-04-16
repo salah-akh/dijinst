@@ -13,7 +13,8 @@ from flask import Flask, jsonify, render_template, request, session
 from flask_cors import CORS
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE_DIR)
 
 from config import Config
 
@@ -32,7 +33,11 @@ try:
 except Exception as exc:
     ANALYZER_IMPORT_ERROR = exc
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, 'templates'),
+    static_folder=os.path.join(BASE_DIR, 'static'),
+)
 app.secret_key = os.getenv('SECRET_KEY', 'vercel-secret-key')
 CORS(app)
 Config.ensure_cache_dir()
@@ -124,6 +129,12 @@ def index():
                 '/api/mutual': 'GET - Get mutual followers',
             },
         })
+
+
+@app.route('/favicon.ico')
+def favicon():
+    """Silence missing favicon requests in environments without a static icon."""
+    return '', 204
 
 
 @app.route('/api/login', methods=['POST'])
