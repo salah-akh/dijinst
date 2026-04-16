@@ -2,51 +2,101 @@
 Flask Web Application for Instagram Follower Analyzer
 Vercel Serverless Functions Compatible
 """
-import sys
+import json
 import os
+import sys
+from datetime import datetime
+from functools import wraps
+from glob import glob
+
+from flask import Flask, jsonify, render_template, request, session
+from flask_cors import CORS
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from config import Config
+
+InstagramClient = None
+FollowerAnalyzer = None
+INSTAGRAM_IMPORT_ERROR = None
+ANALYZER_IMPORT_ERROR = None
+
 try:
-    from flask import Flask, render_template, request, jsonify, session
-    from flask_cors import CORS
-    from functools import wraps
-    import json
-    from datetime import datetime
     from instagram_api import InstagramClient
+except Exception as exc:
+    INSTAGRAM_IMPORT_ERROR = exc
+
+try:
     from follower_analyzer import FollowerAnalyzer
-    from config import Config
-except Exception as e:
-    # Fallback for missing dependencies
-    from flask import Flask, jsonify
-    InstagramClient = None
-    FollowerAnalyzer = None
-    Config = None
+except Exception as exc:
+    ANALYZER_IMPORT_ERROR = exc
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'vercel-secret-key')
-
-try:
-    CORS(app)
-except:
-    pass
-
-# Configure upload folder
-if Config:
-    Config.ensure_cache_dir()
-
-# Configure upload folder
+CORS(app)
 Config.ensure_cache_dir()
+
+if INSTAGRAM_IMPORT_ERROR:
+    print(
+        "Instagram client import failed: "
+        f"{type(INSTAGRAM_IMPORT_ERROR).__name__}: {INSTAGRAM_IMPORT_ERROR}"
+    )
+
+if ANALYZER_IMPORT_ERROR:
+    print(
+        "Follower analyzer import failed: "
+        f"{type(ANALYZER_IMPORT_ERROR).__name__}: {ANALYZER_IMPORT_ERROR}"
+    )
+
+
+def instagram_client_ready():
+    """Return True when the Instagram client imported successfully."""
+    return InstagramClient is not None
+
+
+def analyzer_ready():
+    """Return True when the follower analyzer imported successfully."""
+    return FollowerAnalyzer is not None
+
+
+def dependency_error_response(name, error):
+    """Return a stable JSON response when an optional dependency is unavailable."""
+    return jsonify({
+        'error': f'{name} is not available in this deployment',
+        'details': str(error) if error else None,
+    }), 503
+
+
+def load_cached_data():
+    """Load the latest follower/following cache files from disk."""
+    followers_files = sorted(glob(os.path.join(Config.CACHE_DIR, '*_followers_*.json')))
+    following_files = sorted(glob(os.path.join(Config.CACHE_DIR, '*_following_*.json')))
+
+    if not followers_files or not following_files:
+        raise FileNotFoundError('No cached data found')
+
+    with open(followers_files[-1], 'r', encoding='utf-8') as f:
+        followers = json.load(f)
+
+    with open(following_files[-1], 'r', encoding='utf-8') as f:
+        following = json.load(f)
+
+    return (
+        {int(uid): info for uid, info in followers.items()},
+        {int(uid): info for uid, info in following.items()},
+    )
 
 
 def login_required(f):
     """Decorator to check if user is logged in"""
+
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
             return jsonify({'error': 'Not logged in'}), 401
         return f(*args, **kwargs)
+
     return decorated_function
 
 
@@ -55,12 +105,14 @@ def index():
     """Home page"""
     try:
         return render_template('index.html')
-    except:
-        # Fallback if templates not available
+    except Exception:
         return jsonify({
             'app': 'Instagram Follower Analyzer',
             'version': '1.0.0',
             'status': 'API is running',
+            'instagram_client_ready': instagram_client_ready(),
+            'analyzer_ready': analyzer_ready(),
+            'cache_dir': Config.CACHE_DIR,
             'endpoints': {
                 '/api/health': 'Health check',
                 '/api/login': 'POST - Login',
@@ -69,39 +121,37 @@ def index():
                 '/api/analysis': 'GET - Get analysis',
                 '/api/unfollowers': 'GET - Get unfollowers',
                 '/api/not-following-back': 'GET - Get not following back',
-                '/api/mutual': 'GET - Get mutual followers'
-            }
+                '/api/mutual': 'GET - Get mutual followers',
+            },
         })
 
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
     """Login endpoint"""
-    if not InstagramClient:
-        return jsonify({'error': 'Dependencies not available'}), 503
-    
+    if not instagram_client_ready():
+        return dependency_error_response('Instagram client', INSTAGRAM_IMPORT_ERROR)
+
     try:
         data = request.json or {}
         username = data.get('username')
         password = data.get('password')
-        
+
         if not username or not password:
             return jsonify({'error': 'Username and password required'}), 400
-        
-        # Try to login
+
         client = InstagramClient()
         if client.login(username, password):
             session['username'] = username
             session['user_id'] = client.user_id
-            
+
             return jsonify({
                 'success': True,
                 'message': f'Successfully logged in as {username}',
-                'username': username
+                'username': username,
             })
-        else:
-            return jsonify({'error': 'Login failed'}), 401
-            
+
+        return jsonify({'error': 'Login failed'}), 401
     except Exception as e:
         return jsonify({'error': f'Login error: {str(e)}'}), 500
 
@@ -117,14 +167,15 @@ def api_logout():
 @login_required
 def api_user():
     """Get current user info"""
+    if not instagram_client_ready():
+        return dependency_error_response('Instagram client', INSTAGRAM_IMPORT_ERROR)
+
     try:
-        username = session.get('username')
         client = InstagramClient()
         client.login()
-        
+
         user_info = client.get_user_info()
         return jsonify(user_info)
-        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -133,24 +184,24 @@ def api_user():
 @login_required
 def api_fetch():
     """Fetch followers and following data"""
+    if not instagram_client_ready():
+        return dependency_error_response('Instagram client', INSTAGRAM_IMPORT_ERROR)
+
     try:
-        username = session.get('username')
         client = InstagramClient()
         client.login()
-        
+
         followers = client.get_followers()
         following = client.get_following()
-        
-        # Save data
+
         client.save_data(followers, following)
-        
+
         return jsonify({
             'success': True,
             'message': 'Data fetched successfully',
             'followers_count': len(followers),
-            'following_count': len(following)
+            'following_count': len(following),
         })
-        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -159,40 +210,20 @@ def api_fetch():
 @login_required
 def api_analysis():
     """Get analysis results"""
+    if not analyzer_ready():
+        return dependency_error_response('Follower analyzer', ANALYZER_IMPORT_ERROR)
+
     try:
-        cache_dir = Config.CACHE_DIR
-        
-        # Find latest cache files
-        followers_files = [f for f in os.listdir(cache_dir) if f.endswith('_followers_*.json')]
-        following_files = [f for f in os.listdir(cache_dir) if f.endswith('_following_*.json')]
-        
-        if not followers_files or not following_files:
-            return jsonify({'error': 'No cached data found'}), 404
-        
-        # Load latest files
-        followers_file = os.path.join(cache_dir, sorted(followers_files)[-1])
-        following_file = os.path.join(cache_dir, sorted(following_files)[-1])
-        
-        with open(followers_file, 'r', encoding='utf-8') as f:
-            followers = json.load(f)
-        
-        with open(following_file, 'r', encoding='utf-8') as f:
-            following = json.load(f)
-        
-        # Convert string keys back to integers
-        followers = {int(uid): info for uid, info in followers.items()}
-        following = {int(uid): info for uid, info in following.items()}
-        
-        # Create analyzer
+        followers, following = load_cached_data()
+
         analyzer = FollowerAnalyzer(followers, following)
         stats = analyzer.get_statistics()
         summary = analyzer.export_comparison_summary()
-        
-        # Get specific lists
+
         one_way_followers = analyzer.get_one_way_followers()
         not_following_back = analyzer.get_one_way_following()
         mutuals = analyzer.get_mutual_followers()
-        
+
         return jsonify({
             'statistics': {
                 'total_followers': stats.total_followers,
@@ -208,7 +239,8 @@ def api_analysis():
             'not_following_back_count': len(not_following_back),
             'mutuals_count': len(mutuals),
         })
-        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -217,53 +249,38 @@ def api_analysis():
 @login_required
 def api_unfollowers():
     """Get one-way followers (unfollowers)"""
+    if not analyzer_ready():
+        return dependency_error_response('Follower analyzer', ANALYZER_IMPORT_ERROR)
+
     try:
         limit = request.args.get('limit', 20, type=int)
         filter_keyword = request.args.get('filter', '', type=str)
-        
-        cache_dir = Config.CACHE_DIR
-        followers_files = [f for f in os.listdir(cache_dir) if f.endswith('_followers_*.json')]
-        following_files = [f for f in os.listdir(cache_dir) if f.endswith('_following_*.json')]
-        
-        if not followers_files or not following_files:
-            return jsonify({'error': 'No cached data found'}), 404
-        
-        followers_file = os.path.join(cache_dir, sorted(followers_files)[-1])
-        following_file = os.path.join(cache_dir, sorted(following_files)[-1])
-        
-        with open(followers_file, 'r', encoding='utf-8') as f:
-            followers = json.load(f)
-        
-        with open(following_file, 'r', encoding='utf-8') as f:
-            following = json.load(f)
-        
-        followers = {int(uid): info for uid, info in followers.items()}
-        following = {int(uid): info for uid, info in following.items()}
-        
+        followers, following = load_cached_data()
+
         analyzer = FollowerAnalyzer(followers, following)
         one_way = analyzer.get_one_way_followers()
-        
+
         if filter_keyword:
             one_way = analyzer.filter_by_keyword(one_way, filter_keyword)
-        
-        # Convert to list and limit
+
         results = [
             {
                 'id': uid,
                 'username': info['username'],
                 'full_name': info.get('full_name', 'N/A'),
                 'is_verified': info.get('is_verified', False),
-                'is_private': info.get('is_private', False)
+                'is_private': info.get('is_private', False),
             }
             for uid, info in list(one_way.items())[:limit]
         ]
-        
+
         return jsonify({
             'total': len(one_way),
             'count': len(results),
-            'data': results
+            'data': results,
         })
-        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -272,52 +289,38 @@ def api_unfollowers():
 @login_required
 def api_not_following_back():
     """Get people you follow but who don't follow back"""
+    if not analyzer_ready():
+        return dependency_error_response('Follower analyzer', ANALYZER_IMPORT_ERROR)
+
     try:
         limit = request.args.get('limit', 20, type=int)
         filter_keyword = request.args.get('filter', '', type=str)
-        
-        cache_dir = Config.CACHE_DIR
-        followers_files = [f for f in os.listdir(cache_dir) if f.endswith('_followers_*.json')]
-        following_files = [f for f in os.listdir(cache_dir) if f.endswith('_following_*.json')]
-        
-        if not followers_files or not following_files:
-            return jsonify({'error': 'No cached data found'}), 404
-        
-        followers_file = os.path.join(cache_dir, sorted(followers_files)[-1])
-        following_file = os.path.join(cache_dir, sorted(following_files)[-1])
-        
-        with open(followers_file, 'r', encoding='utf-8') as f:
-            followers = json.load(f)
-        
-        with open(following_file, 'r', encoding='utf-8') as f:
-            following = json.load(f)
-        
-        followers = {int(uid): info for uid, info in followers.items()}
-        following = {int(uid): info for uid, info in following.items()}
-        
+        followers, following = load_cached_data()
+
         analyzer = FollowerAnalyzer(followers, following)
         one_way = analyzer.get_one_way_following()
-        
+
         if filter_keyword:
             one_way = analyzer.filter_by_keyword(one_way, filter_keyword)
-        
+
         results = [
             {
                 'id': uid,
                 'username': info['username'],
                 'full_name': info.get('full_name', 'N/A'),
                 'is_verified': info.get('is_verified', False),
-                'is_private': info.get('is_private', False)
+                'is_private': info.get('is_private', False),
             }
             for uid, info in list(one_way.items())[:limit]
         ]
-        
+
         return jsonify({
             'total': len(one_way),
             'count': len(results),
-            'data': results
+            'data': results,
         })
-        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -326,31 +329,16 @@ def api_not_following_back():
 @login_required
 def api_mutual():
     """Get mutual followers"""
+    if not analyzer_ready():
+        return dependency_error_response('Follower analyzer', ANALYZER_IMPORT_ERROR)
+
     try:
         limit = request.args.get('limit', 20, type=int)
-        
-        cache_dir = Config.CACHE_DIR
-        followers_files = [f for f in os.listdir(cache_dir) if f.endswith('_followers_*.json')]
-        following_files = [f for f in os.listdir(cache_dir) if f.endswith('_following_*.json')]
-        
-        if not followers_files or not following_files:
-            return jsonify({'error': 'No cached data found'}), 404
-        
-        followers_file = os.path.join(cache_dir, sorted(followers_files)[-1])
-        following_file = os.path.join(cache_dir, sorted(following_files)[-1])
-        
-        with open(followers_file, 'r', encoding='utf-8') as f:
-            followers = json.load(f)
-        
-        with open(following_file, 'r', encoding='utf-8') as f:
-            following = json.load(f)
-        
-        followers = {int(uid): info for uid, info in followers.items()}
-        following = {int(uid): info for uid, info in following.items()}
-        
+        followers, following = load_cached_data()
+
         analyzer = FollowerAnalyzer(followers, following)
         mutuals = analyzer.get_mutual_followers()
-        
+
         results = [
             {
                 'id': uid,
@@ -360,13 +348,14 @@ def api_mutual():
             }
             for uid, info in list(mutuals.items())[:limit]
         ]
-        
+
         return jsonify({
             'total': len(mutuals),
             'count': len(results),
-            'data': results
+            'data': results,
         })
-        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -374,7 +363,15 @@ def api_mutual():
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'OK', 'timestamp': datetime.now().isoformat()})
+    return jsonify({
+        'status': 'OK',
+        'timestamp': datetime.now().isoformat(),
+        'instagram_client_ready': instagram_client_ready(),
+        'instagram_import_error': str(INSTAGRAM_IMPORT_ERROR) if INSTAGRAM_IMPORT_ERROR else None,
+        'analyzer_ready': analyzer_ready(),
+        'analyzer_import_error': str(ANALYZER_IMPORT_ERROR) if ANALYZER_IMPORT_ERROR else None,
+        'cache_dir': Config.CACHE_DIR,
+    })
 
 
 @app.errorhandler(404)
